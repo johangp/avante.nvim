@@ -1,3 +1,4 @@
+local StreamingJSONParser = require("avante.utils.streaming_json_parser")
 local Utils = require("avante.utils")
 local Llm = require("avante.llm")
 local Highlights = require("avante.highlights")
@@ -33,6 +34,7 @@ local SUGGESTION_NS = api.nvim_create_namespace("avante_suggestion")
 ---@field _timer? uv.uv_timer_t
 ---@field _contexts table
 ---@field is_on_throttle boolean
+---@field _streaming_json_parser? avante.StreamingJSONParser
 local Suggestion = {}
 Suggestion.__index = Suggestion
 
@@ -157,6 +159,27 @@ local function build_suggestion_list(full_response, bufnr)
     :totable()
 end
 
+function Suggestion:_apply_suggestion_chunk(chunk)
+  if not self._streaming_json_parser then
+    self._streaming_json_parser = StreamingJSONParser:new()
+    self:ctx().suggestions_list = {}
+    self:ctx().current_suggestions_idx = 1
+  end
+
+  local _, is_complete = self._streaming_json_parser:parse(chunk)
+  local suggestions = self._streaming_json_parser:getCurrentPartial()
+  if not suggestions then return end
+
+  local bufnr = api.nvim_get_current_buf()
+  local current_lines = Utils.get_buf_lines(0, -1, bufnr)
+  local suggestion_set = build_suggestion_set(suggestions, current_lines)
+  if #suggestion_set == 0 then return end
+  table.insert(self:ctx().suggestions_list, suggestion_set)
+  self:show()
+
+  if is_complete then self._streaming_json_parser = nil end
+end
+
 function Suggestion:suggest()
   Utils.debug("suggesting")
 
@@ -171,24 +194,13 @@ function Suggestion:suggest()
   table.insert(lines, "")
   local code_content = table.concat(Utils.prepend_line_numbers(lines), "\n")
 
-  local full_response = ""
-
   local provider = Providers[Config.auto_suggestions_provider or Config.provider]
 
   ---@type AvanteLLMMessage[]
   local llm_messages = {
     {
       role = "user",
-      content = [[
-<filepath>a.py</filepath>
-<code>
-L1: def fib
-L2:
-L3: if __name__ == "__main__":
-L4:     # just pass
-L5:     pass
-</code>
-      ]],
+      content = [[\n<filepath>a.py</filepath>\n<code>\nL1: def fib\nL2:\nL3: if __name__ == "__main__":\nL4:     # just pass\nL5:     pass\n</code>\n      ]],
     },
     {
       role = "assistant",
@@ -200,36 +212,7 @@ L5:     pass
     },
     {
       role = "assistant",
-      content = [[
-<suggestions>
-[
-  [
-    {
-      "start_row": 1,
-      "end_row": 1,
-      "content": "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)"
-    },
-    {
-      "start_row": 4,
-      "end_row": 5,
-      "content": "    fib(int(input()))"
-    },
-  ],
-  [
-    {
-      "start_row": 1,
-      "end_row": 1,
-      "content": "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        yield a\n        a, b = b, a + b"
-    },
-    {
-      "start_row": 4,
-      "end_row": 5,
-      "content": "    list(fib(int(input())))"
-    },
-  ]
-]
-</suggestions>
-          ]],
+      content = [[\n<suggestions>\n[\n  [\n    {\n      "start_row": 1,\n      "end_row": 1,\n      "content": "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)"\n    },\n    {\n      "start_row": 4,\n      "end_row": 5,\n      "content": "    fib(int(input()))"\n    },\n  ],\n  [\n    {\n      "start_row": 1,\n      "end_row": 1,\n      "content": "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        yield a\n        a, b = b, a + b"\n    },\n    {\n      "start_row": 4,\n      "end_row": 5,\n      "content": "    list(fib(int(input())))\"\n    },\n  ]\n]\n</suggestions>\n          ]],
     },
   }
 
@@ -250,23 +233,13 @@ L5:     pass
     instructions = vim.json.encode(doc),
     mode = "suggesting",
     on_start = function(_) end,
-    on_chunk = function(chunk) full_response = full_response .. chunk end,
+    on_chunk = function(chunk) self:_apply_suggestion_chunk(chunk) end,
     on_stop = function(stop_opts)
       local err = stop_opts.error
       if err then
         Utils.error("Error while suggesting: " .. vim.inspect(err), { once = true, title = "Avante" })
         return
       end
-      Utils.debug("full_response:", full_response)
-      vim.schedule(function()
-        local cursor_row, cursor_col = Utils.get_cursor_pos()
-        if cursor_row ~= doc.position.row or cursor_col ~= doc.position.col then return end
-
-        ctx.suggestions_list = build_suggestion_list(full_response, bufnr)
-        ctx.current_suggestions_idx = 1
-
-        self:show()
-      end)
     end,
   })
 end
